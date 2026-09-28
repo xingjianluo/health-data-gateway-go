@@ -50,7 +50,6 @@ func contains[T ~string](list []T, v T) bool {
 // version 为空时使用最新版本。各拒绝分支原因互斥、依据可解释。
 func (d *Decider) Decide(subject SubjectID, purpose Purpose, category Category, version string) Decision {
 	now := d.clock()
-
 	var pol Policy
 	var ver string
 	var hasPolicy bool
@@ -61,6 +60,14 @@ func (d *Decider) Decide(subject SubjectID, purpose Purpose, category Category, 
 		pol, hasPolicy = d.archive.Get(version)
 		ver = version
 	}
+	return d.DecideAt(subject, purpose, category, ver, now, hasPolicy, pol)
+}
+
+// DecideAt 在给定的判定时刻、给定策略快照上做授权判定。
+// 批量访问用它保证：全批共用同一个 now（同意过期口径一致）、
+// 同一份策略快照（批次处理中途发布新版本也不换口径）。
+func (d *Decider) DecideAt(subject SubjectID, purpose Purpose, category Category,
+	ver string, now time.Time, hasPolicy bool, pol Policy) Decision {
 	if !hasPolicy {
 		return Decision{
 			Allowed:       false,

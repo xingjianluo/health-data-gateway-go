@@ -18,6 +18,8 @@ type AccessResponse struct {
 	AuditID  int64
 	Decision Decision
 	Record   Record // 最小化+脱敏后的字段；拒绝时为 nil
+	// Degraded 是否为降级放行（允许返回但有字段被跳过）
+	Degraded bool
 }
 
 // DegradeMode 脱敏/最小化失败时的处理策略
@@ -35,10 +37,13 @@ type Gateway struct {
 	archive *PolicyArchive
 	store   *HealthStore
 	audit   *AuditLog
+	batches *BatchLog
 	decider *Decider
 	masker  *Minimizer
 	clock   func() time.Time
 	Degrade DegradeMode
+	// BatchLimit 单批主体数量上限；<=0 时使用 MaxBatchSubjects
+	BatchLimit int
 }
 
 func New(archive *PolicyArchive, store *HealthStore, audit *AuditLog) *Gateway {
@@ -46,6 +51,7 @@ func New(archive *PolicyArchive, store *HealthStore, audit *AuditLog) *Gateway {
 		archive: archive,
 		store:   store,
 		audit:   audit,
+		batches: NewBatchLog(),
 		decider: NewDecider(archive),
 		masker:  NewMinimizer(),
 		clock:   time.Now,
@@ -53,20 +59,56 @@ func New(archive *PolicyArchive, store *HealthStore, audit *AuditLog) *Gateway {
 	}
 }
 
+// WithBatchLog 注入自定义整批审计日志（默认 New 时已内置一个）
+func (g *Gateway) WithBatchLog(b *BatchLog) *Gateway {
+	g.batches = b
+	return g
+}
+
+// BatchLog 返回整批审计日志
+func (g *Gateway) BatchLog() *BatchLog { return g.batches }
+
 // Access 统一访问入口。无论允许还是拒绝，都会写入一条标注策略版本的审计记录。
 func (g *Gateway) Access(req AccessRequest) AccessResponse {
-	// 1. 同意校验（可按显式版本或最新版本判定）
-	dec := g.decider.Decide(req.Subject, req.Purpose, req.Category, req.Version)
+	// 单主体访问：判定时刻取当前时钟；版本为空时按最新版本，与批量层共用 processSubject
+	now := g.clock()
+	pol, ver, hasPolicy := g.resolvePolicy(req.Version, now)
+	return g.processSubject(req.Subject, req.Purpose, req.Category, req.Fields,
+		req.Entry, ver, now, hasPolicy, pol, 0)
+}
+
+// resolvePolicy 确定本次访问要使用的策略快照与版本号。
+// version 为空时取当前最新版本。返回的 hasPolicy=false 表示版本不存在，
+// 由 processSubject 落一条 policy_version_missing 拒绝结论。
+func (g *Gateway) resolvePolicy(version string, now time.Time) (Policy, string, bool) {
+	if version != "" {
+		pol, ok := g.archive.Get(version)
+		return pol, version, ok
+	}
+	pol, ok := g.archive.Latest()
+	return pol, pol.Version, ok
+}
+
+// processSubject 处理单个数据主体：同意校验 → 读取 → 字段交集 → 最小化脱敏 → 逐条审计。
+// 同一批次内所有主体共用固定的 policyVersion 与 evaluatedAt，保证全批口径一致、
+// 批次处理中途发布的新版本不会改变本批结论。batchID>0 时逐条审计关联到整批记录。
+func (g *Gateway) processSubject(subject SubjectID, purpose Purpose, category Category,
+	fields []FieldName, entry, policyVersion string, evaluatedAt time.Time,
+	hasPolicy bool, pol Policy, batchID int64) AccessResponse {
+
+	// 1. 同意校验（使用全批固定的版本与判定时刻）
+	dec := g.decider.DecideAt(subject, purpose, category, policyVersion, evaluatedAt, hasPolicy, pol)
 
 	auditRec := AuditRecord{
-		Timestamp:     g.clock(),
-		Entry:         req.Entry,
-		SubjectID:     req.Subject,
-		Purpose:       req.Purpose,
-		Category:      req.Category,
-		Requested:     req.Fields,
+		Timestamp:     evaluatedAt,
+		Entry:         entry,
+		SubjectID:     subject,
+		Purpose:       purpose,
+		Category:      category,
+		Requested:     fields,
 		Decision:      dec,
 		PolicyVersion: dec.PolicyVersion,
+		BatchID:       batchID,
 	}
 
 	if !dec.Allowed {
@@ -75,13 +117,12 @@ func (g *Gateway) Access(req AccessRequest) AccessResponse {
 		return AccessResponse{AuditID: saved.ID, Decision: dec}
 	}
 
-	// 2. 读取本地原始数据
-	pol, _ := g.archive.Get(dec.PolicyVersion)
-	rec, ok := g.store.Get(req.Subject, req.Category)
+	// 2. 读取本地原始数据（每个主体独立读取，结果互不串用）
+	rec, ok := g.store.Get(subject, category)
 	if !ok {
 		dec.Allowed = false
 		dec.Reason = ReasonRecordNotFound
-		dec.Basis = "本地存储中不存在主体 " + string(req.Subject) + " 的类别 " + string(req.Category) + " 数据"
+		dec.Basis = "本地存储中不存在主体 " + string(subject) + " 的类别 " + string(category) + " 数据"
 		auditRec.Decision = dec
 		auditRec.Note = "访问被拒绝：本地无对应数据"
 		saved := g.audit.Append(auditRec)
@@ -89,8 +130,8 @@ func (g *Gateway) Access(req AccessRequest) AccessResponse {
 	}
 
 	// 3. 字段授权取交集：请求字段 ∩ 同意白名单，保证结果不超出授权范围
-	allowedFields := intersectFields(req.Fields, consentFields(pol, req.Subject))
-	if len(req.Fields) > 0 && len(allowedFields) == 0 {
+	allowedFields := intersectFields(fields, consentFields(pol, subject))
+	if len(fields) > 0 && len(allowedFields) == 0 {
 		dec.Allowed = false
 		dec.Reason = ReasonFieldsNotAuthorized
 		dec.Basis = "请求的字段均不在同意白名单内"
@@ -100,7 +141,7 @@ func (g *Gateway) Access(req AccessRequest) AccessResponse {
 		return AccessResponse{AuditID: saved.ID, Decision: dec}
 	}
 
-	// 4. 最小化 + 脱敏
+	// 4. 最小化 + 脱敏（每个主体独立执行）
 	var result MinimizeResult
 	var maskErr error
 	if g.Degrade == DegradeSkip {
@@ -120,10 +161,17 @@ func (g *Gateway) Access(req AccessRequest) AccessResponse {
 		return AccessResponse{AuditID: saved.ID, Decision: dec}
 	}
 
+	degraded := len(result.Skipped) > 0
 	auditRec.FieldsReturned = fieldNames(result.Record)
 	auditRec.Note = joinNotes(result.Notes)
+	auditRec.Degraded = degraded
 	saved := g.audit.Append(auditRec)
-	return AccessResponse{AuditID: saved.ID, Decision: dec, Record: result.Record}
+	return AccessResponse{
+		AuditID:  saved.ID,
+		Decision: dec,
+		Record:   result.Record,
+		Degraded: degraded,
+	}
 }
 
 // Replay 按审计记录当时标注的策略版本复现历史授权结论。

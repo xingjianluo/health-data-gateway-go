@@ -30,6 +30,8 @@ func (e *MinimizeError) Unwrap() error { return e.Err }
 type MinimizeResult struct {
 	Record Record
 	Notes  []string
+	// Skipped 降级模式下被跳过（未返回）的授权字段；非空即代表发生了降级
+	Skipped []FieldName
 }
 
 // Minimizer 执行字段最小化与标识脱敏
@@ -89,10 +91,12 @@ func (m *Minimizer) DegradeApply(rec Record, authorized []FieldName, identifiers
 
 	out := make(Record, len(authorized))
 	var notes []string
+	var skipped []FieldName
 	for _, f := range authorized {
 		raw, present := rec[f]
 		if !present {
 			notes = append(notes, fmt.Sprintf("字段 %s 缺失，降级跳过", f))
+			skipped = append(skipped, f)
 			continue
 		}
 		if !isIdentifier[f] {
@@ -102,17 +106,19 @@ func (m *Minimizer) DegradeApply(rec Record, authorized []FieldName, identifiers
 		rule, ok := rules[f]
 		if !ok {
 			notes = append(notes, fmt.Sprintf("标识字段 %s 无匹配脱敏策略，降级跳过（不返回原文）", f))
+			skipped = append(skipped, f)
 			continue
 		}
 		masked, err := maskValue(raw, rule.Action)
 		if err != nil {
 			notes = append(notes, fmt.Sprintf("字段 %s 脱敏失败（%s），降级跳过", f, err.Error()))
+			skipped = append(skipped, f)
 			continue
 		}
 		out[f] = masked
 		notes = append(notes, fmt.Sprintf("字段 %s 按动作 %s 脱敏", f, rule.Action))
 	}
-	return MinimizeResult{Record: out, Notes: notes}
+	return MinimizeResult{Record: out, Notes: notes, Skipped: skipped}
 }
 
 func maskValue(v string, action MaskAction) (string, error) {
