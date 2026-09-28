@@ -49,8 +49,12 @@ func contains[T ~string](list []T, v T) bool {
 // Decide 按指定策略版本对访问请求做授权判定。
 // version 为空时使用最新版本。各拒绝分支原因互斥、依据可解释。
 func (d *Decider) Decide(subject SubjectID, purpose Purpose, category Category, version string) Decision {
-	now := d.clock()
+	return d.DecideAt(subject, purpose, category, version, d.clock())
+}
 
+// DecideAt 与 Decide 相同，但使用显式传入的判断时刻。
+// 批量访问用它把整批固定在同一个判断时刻，保证批次内口径一致。
+func (d *Decider) DecideAt(subject SubjectID, purpose Purpose, category Category, version string, now time.Time) Decision {
 	var pol Policy
 	var ver string
 	var hasPolicy bool

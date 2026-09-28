@@ -18,6 +18,12 @@ type AuditRecord struct {
 	FieldsReturned []FieldName
 	PolicyVersion  string
 	Note           string
+
+	// 批量访问关联字段（单主体访问时保持零值，兼容历史用法）
+	BatchID      string        // 所属批次 ID；空表示非批量记录
+	IsBatchHead  bool          // 是否为批次汇总记录（一条批次一条）
+	SubjectIndex int           // 主体在批次中的稳定下标；汇总记录为 -1
+	Outcome      OutcomeStatus // 该主体/批次的最终状态（allowed/denied/degraded）
 }
 
 // AuditLog 并发安全的只追加审计日志
@@ -71,4 +77,18 @@ func (l *AuditLog) Len() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.records)
+}
+
+// ListByBatch 按批次 ID 返回该批次的全部审计记录（1 条批次汇总 + 每个主体 1 条），按写入顺序。
+// 同批次并发写入时记录不丢失、不错配：每条主体记录都带稳定的 SubjectIndex。
+func (l *AuditLog) ListByBatch(batchID string) []AuditRecord {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []AuditRecord
+	for _, r := range l.records {
+		if r.BatchID == batchID {
+			out = append(out, r)
+		}
+	}
+	return out
 }
